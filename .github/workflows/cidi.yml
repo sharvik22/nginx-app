@@ -1,0 +1,120 @@
+---
+name: Docker Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: sharvik40/nginx-app
+  K8S_DEPLOYMENT: nginx-app-deployment
+  K8S_NAMESPACE: default
+  CONTAINER_NAME: nginx-app
+
+jobs:
+  update-docker-images:
+    name: Update Docker Images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Determine Docker tag
+        id: docker_tag
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "TAG=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.docker_tag.outputs.TAG }}
+          labels: |
+            version=${{ steps.docker_tag.outputs.TAG }}
+            build.date=${{ github.run_number }}
+            git.commit=${{ github.sha }}
+
+  deploy-k8s:
+    name: Deploy K8S
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: update-docker-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/setup-kubectl@v3
+      
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          # Декодируем из base64 если нужно, или используем как есть
+          if echo "${{ secrets.K8S_CONFIG }}" | base64 -d &>/dev/null; then
+            echo "${{ secrets.K8S_CONFIG }}" | base64 -d > ~/.kube/config
+          else
+            echo "${{ secrets.K8S_CONFIG }}" > ~/.kube/config
+          fi
+          chmod 600 ~/.kube/config
+          
+          # Добавляем insecure-skip-tls-verify в конфиг если его нет
+          if ! grep -q "insecure-skip-tls-verify" ~/.kube/config; then
+            sed -i '/cluster:/a \    insecure-skip-tls-verify: true' ~/.kube/config
+          fi
+
+      - name: Verify kubeconfig
+        run: |
+          echo "=== Kubeconfig content ==="
+          cat ~/.kube/config
+          echo "=== Cluster info ==="
+          kubectl cluster-info --insecure-skip-tls-verify || true
+          echo "=== Nodes ==="
+          kubectl get nodes --insecure-skip-tls-verify || true
+
+      - name: Safe deployment update
+        run: |
+          # Получаем текущий deployment
+          kubectl get deploy/${{ env.K8S_DEPLOYMENT }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            -o yaml > deployment.yaml \
+            --insecure-skip-tls-verify
+          
+          # Обновляем версию образа
+          sed -i "s|image:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}|g" deployment.yaml
+          
+          # Применяем изменения
+          kubectl apply -f deployment.yaml \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --insecure-skip-tls-verify
+          
+          # Проверяем обновление
+          kubectl rollout status deploy/${{ env.K8S_DEPLOYMENT }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --insecure-skip-tls-verify \
+            --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          echo "=== Deployment Status ==="
+          kubectl get deploy/${{ env.K8S_DEPLOYMENT }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            -o wide \
+            --insecure-skip-tls-verify
+          
+          echo ""
+          echo "=== Running Pods ==="
+          kubectl get pods \
+            -n ${{ env.K8S_NAMESPACE }} \
+            -l app=nginx-app \
+            -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.containers[0].image}{"\n"}{end}' \
+            --insecure-skip-tls-verify
